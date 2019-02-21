@@ -25,7 +25,6 @@ import com.google.api.core.CurrentMillisClock;
 import com.google.api.core.InternalApi;
 import com.google.api.gax.batching.FlowControlSettings;
 import com.google.api.gax.batching.FlowController;
-import com.google.api.gax.batching.FlowController.LimitExceededBehavior;
 import com.google.api.gax.core.CredentialsProvider;
 import com.google.api.gax.core.Distribution;
 import com.google.api.gax.core.ExecutorProvider;
@@ -107,7 +106,6 @@ public class Subscriber extends AbstractApiService {
   private final Distribution ackLatencyDistribution =
       new Distribution(MAX_ACK_DEADLINE_SECONDS + 1);
 
-  private SubscriberStub subStub;
   private final SubscriberStubSettings subStubSettings;
   private final FlowController flowController;
   private final int numPullers;
@@ -116,7 +114,6 @@ public class Subscriber extends AbstractApiService {
   private final List<StreamingSubscriberConnection> streamingSubscriberConnections;
   private final ApiClock clock;
   private final List<AutoCloseable> closeables = new ArrayList<>();
-  private ScheduledFuture<?> ackDeadlineUpdater;
 
   private Subscriber(Builder builder) {
     receiver = builder.receiver;
@@ -133,12 +130,15 @@ public class Subscriber extends AbstractApiService {
     maxAckExtensionPeriod = builder.maxAckExtensionPeriod;
     clock = builder.clock.isPresent() ? builder.clock.get() : CurrentMillisClock.getDefaultClock();
 
+    logger.info("Parallelism: " + builder.parallelPullCount);
+    logger.info("Flow control settings: " + flowControlSettings);
+
     flowController =
         new FlowController(
             builder
                 .flowControlSettings
                 .toBuilder()
-                .setLimitExceededBehavior(LimitExceededBehavior.ThrowException)
+                .setLimitExceededBehavior(FlowController.LimitExceededBehavior.ThrowException)
                 .build());
 
     executor = builder.executorProvider.getExecutor();
@@ -146,7 +146,7 @@ public class Subscriber extends AbstractApiService {
       closeables.add(
           new AutoCloseable() {
             @Override
-            public void close() throws IOException {
+            public void close() {
               executor.shutdown();
             }
           });
@@ -156,7 +156,7 @@ public class Subscriber extends AbstractApiService {
       closeables.add(
           new AutoCloseable() {
             @Override
-            public void close() throws IOException {
+            public void close() {
               alarmsExecutor.shutdown();
             }
           });
@@ -171,7 +171,7 @@ public class Subscriber extends AbstractApiService {
     try {
       this.subStubSettings =
           SubscriberStubSettings.newBuilder()
-              .setExecutorProvider(FixedExecutorProvider.create(alarmsExecutor))
+              .setExecutorProvider(builder.systemExecutorProvider)
               .setCredentialsProvider(builder.credentialsProvider)
               .setTransportChannelProvider(channelProvider)
               .setHeaderProvider(builder.headerProvider)
@@ -278,13 +278,6 @@ public class Subscriber extends AbstractApiService {
   protected void doStart() {
     logger.log(Level.FINE, "Starting subscriber group.");
 
-    try {
-      this.subStub = GrpcSubscriberStub.create(subStubSettings);
-    } catch (IOException e) {
-      // doesn't matter what we throw, the Service will just catch it and fail to start.
-      throw new IllegalStateException(e);
-    }
-
     // When started, connections submit tasks to the executor.
     // These tasks must finish before the connections can declare themselves running.
     // If we have a single-thread executor and call startStreamingConnections from the
@@ -337,7 +330,7 @@ public class Subscriber extends AbstractApiService {
                 ackExpirationPadding,
                 maxAckExtensionPeriod,
                 ackLatencyDistribution,
-                subStub,
+                GrpcSubscriberStub.create(subStubSettings),
                 i,
                 flowController,
                 executor,
@@ -367,9 +360,6 @@ public class Subscriber extends AbstractApiService {
 
   private void stopAllStreamingConnections() {
     stopConnections(streamingSubscriberConnections);
-    if (ackDeadlineUpdater != null) {
-      ackDeadlineUpdater.cancel(true);
-    }
   }
 
   private void startConnections(
@@ -430,6 +420,7 @@ public class Subscriber extends AbstractApiService {
         SubscriptionAdminSettings.defaultGrpcTransportProviderBuilder()
             .setMaxInboundMessageSize(MAX_INBOUND_MESSAGE_SIZE)
             .setKeepAliveTime(Duration.ofMinutes(5))
+            .setPoolSize(1)
             .build();
     HeaderProvider headerProvider = new NoHeaderProvider();
     HeaderProvider internalHeaderProvider =

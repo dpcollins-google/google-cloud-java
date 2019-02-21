@@ -17,26 +17,13 @@
 package com.google.cloud.pubsub.v1;
 
 import com.google.api.core.ApiClock;
-import com.google.api.core.ApiFutureCallback;
-import com.google.api.core.ApiFutures;
 import com.google.api.core.InternalApi;
-import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.batching.FlowController;
-import com.google.api.gax.batching.FlowController.FlowControlException;
 import com.google.api.gax.core.Distribution;
-import com.google.cloud.pubsub.v1.MessageDispatcher.OutstandingMessageBatch.OutstandingMessage;
 import com.google.common.primitives.Ints;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.google.pubsub.v1.PubsubMessage;
 import com.google.pubsub.v1.ReceivedMessage;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Deque;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
+
+import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -84,8 +71,6 @@ class MessageDispatcher {
   private final Lock jobLock;
   private ScheduledFuture<?> backgroundJob;
 
-  private final LinkedBlockingDeque<OutstandingMessageBatch> outstandingMessageBatches = new LinkedBlockingDeque<>();
-
   // To keep track of number of seconds the receiver takes to process messages.
   private final Distribution ackLatencyDistribution;
 
@@ -103,10 +88,6 @@ class MessageDispatcher {
       this.deadlineExtensionSeconds = deadlineExtensionSeconds;
     }
 
-    public void addAckId(String ackId) {
-      ackIds.add(ackId);
-    }
-
     @Override
     public String toString() {
       return String.format(
@@ -115,14 +96,8 @@ class MessageDispatcher {
     }
   }
 
-  /** Internal representation of a reply to a Pubsub message, to be sent back to the service. */
-  public enum AckReply {
-    ACK,
-    NACK
-  }
-
   /** Handles callbacks for acking/nacking messages from the {@link MessageReceiver}. */
-  private class AckHandler implements ApiFutureCallback<AckReply> {
+  private class AckHandler implements AckReplyConsumer {
     private final String ackId;
     private final int outstandingBytes;
     private final long receivedTimeMillis;
@@ -147,37 +122,21 @@ class MessageDispatcher {
       }
       flowController.release(1, outstandingBytes);
       messagesWaiter.incrementPendingMessages(-1);
-      processOutstandingBatches();
     }
 
     @Override
-    public void onFailure(Throwable t) {
-      logger.log(
-          Level.WARNING,
-          "MessageReceiver failed to processes ack ID: " + ackId + ", the message will be nacked.",
-          t);
-      pendingNacks.add(ackId);
+    public void ack() {
+      // Record the latency rounded to the next closest integer.
+      ackLatencyDistribution.record(
+          Ints.saturatedCast(
+              (long) Math.ceil((clock.millisTime() - receivedTimeMillis) / 1000D)));
+      pendingAcks.add(ackId);
       forget();
     }
 
     @Override
-    public void onSuccess(AckReply reply) {
-      LinkedBlockingQueue<String> destination;
-      switch (reply) {
-        case ACK:
-          destination = pendingAcks;
-          // Record the latency rounded to the next closest integer.
-          ackLatencyDistribution.record(
-              Ints.saturatedCast(
-                  (long) Math.ceil((clock.millisTime() - receivedTimeMillis) / 1000D)));
-          break;
-        case NACK:
-          destination = pendingNacks;
-          break;
-        default:
-          throw new IllegalArgumentException(String.format("AckReply: %s not supported", reply));
-      }
-      destination.add(ackId);
+    public void nack() {
+      pendingNacks.add(ackId);
       forget();
     }
   }
@@ -288,145 +247,97 @@ class MessageDispatcher {
     return messageDeadlineSeconds.get();
   }
 
-  static class OutstandingMessageBatch {
-    private final Deque<OutstandingMessage> messages;
-    private final Runnable doneCallback;
-
-    static class OutstandingMessage {
-      private final ReceivedMessage receivedMessage;
-      private final AckHandler ackHandler;
-
-      public OutstandingMessage(ReceivedMessage receivedMessage, AckHandler ackHandler) {
-        this.receivedMessage = receivedMessage;
-        this.ackHandler = ackHandler;
-      }
-
-      public ReceivedMessage receivedMessage() {
-        return receivedMessage;
-      }
-
-      public AckHandler ackHandler() {
-        return ackHandler;
-      }
+  /** Return whether the number of messages and bytes are allowed by flow control. */
+  private boolean isAllowedByFlowControl(long messages, long bytes) {
+    try {
+      // This is a non-blocking flow controller.
+      flowController.reserve(messages, bytes);
+    } catch (FlowController.MaxOutstandingElementCountReachedException
+        | FlowController.MaxOutstandingRequestBytesReachedException flowControlException) {
+      // This cannot be processed now due to flow control.
+      return false;
+    } catch (FlowController.FlowControlException unexpectedException) {
+      throw new IllegalStateException("Flow control unexpected exception", unexpectedException);
     }
-
-    public OutstandingMessageBatch(Runnable doneCallback) {
-      this.messages = new LinkedList<>();
-      this.doneCallback = doneCallback;
-    }
-
-    public void addMessage(ReceivedMessage receivedMessage, AckHandler ackHandler) {
-      this.messages.add(new OutstandingMessage(receivedMessage, ackHandler));
-    }
-
-    public Deque<OutstandingMessage> messages() {
-      return messages;
-    }
+    return true;
   }
 
-  public void processReceivedMessages(List<ReceivedMessage> messages, Runnable doneCallback) {
+  public void processReceivedMessages(List<ReceivedMessage> messages) {
     if (messages.isEmpty()) {
-      doneCallback.run();
       return;
     }
 
     Instant totalExpiration = now().plus(maxAckExtensionPeriod);
-    OutstandingMessageBatch outstandingBatch = new OutstandingMessageBatch(doneCallback);
-    for (ReceivedMessage message : messages) {
-      AckHandler ackHandler =
-          new AckHandler(
-              message.getAckId(), message.getMessage().getSerializedSize(), totalExpiration);
-      if (pendingMessages.putIfAbsent(message.getAckId(), ackHandler) != null) {
-        // putIfAbsent puts ackHandler if ackID isn't previously mapped, then return the
-        // previously-mapped element.
-        // If the previous element is not null, we already have the message and the new one is
-        // definitely a duplicate.
-        // Don't nack this, because that'd also nack the one we already have in queue.
-        // Don't update the existing one's total expiration either. If the user "loses" the message,
-        // we want to eventually
-        // totally expire so that pubsub service sends us the message again.
-        continue;
+
+    // Handle as many individual messages as possible if not, and nack the rest.
+    ListIterator<ReceivedMessage> messageIter = messages.listIterator();
+    while (messageIter.hasNext()) {
+      ReceivedMessage message = messageIter.next();
+      if (!isAllowedByFlowControl(1, message.getMessage().getSerializedSize())) {
+        messageIter.previous();  // Step back so the current message gets nacked.
+        break;
       }
-      outstandingBatch.addMessage(message, ackHandler);
-      pendingReceipts.add(message.getAckId());
+      processReceivedMessage(message, totalExpiration);
     }
 
-    if (outstandingBatch.messages.isEmpty()) {
-      doneCallback.run();
+    // Nack remaining messages.
+    int dropped = 0;
+    while (messageIter.hasNext()) {
+      dropped++;
+      ReceivedMessage message = messageIter.next();
+      pendingNacks.add(message.getAckId());
+    }
+    if (dropped > 0) {
+      logger.info("Dropped " + dropped + " messages due to flow control.");
+    }
+  }
+
+  /** Process a single received message already allowed by @limiter */
+  private void processReceivedMessage(final ReceivedMessage message, Instant totalExpiration) {
+    messagesWaiter.incrementPendingMessages(1);
+    final AckHandler ackHandler = new AckHandler(message.getAckId(), message.getMessage().getSerializedSize(), totalExpiration);
+    if (pendingMessages.putIfAbsent(message.getAckId(), ackHandler) != null) {
+      // putIfAbsent puts ackHandler if ackID isn't previously mapped, then return the
+      // previously-mapped element.
+      // If the previous element is not null, we already have the message and the new one is
+      // definitely a duplicate.
+      // Don't nack this, because that'd also nack the one we already have in queue.
+      // Don't update the existing one's total expiration either. If the user "loses" the message,
+      // we want to eventually
+      // totally expire so that pubsub service sends us the message again.
       return;
     }
-
-    messagesWaiter.incrementPendingMessages(outstandingBatch.messages.size());
-    outstandingMessageBatches.add(outstandingBatch);
-    processOutstandingBatches();
-  }
-
-  private void processOutstandingBatches() {
-    for (OutstandingMessageBatch nextBatch = outstandingMessageBatches.poll();
-         nextBatch != null;
-         nextBatch = outstandingMessageBatches.poll()) {
-      for (OutstandingMessage nextMessage = nextBatch.messages.poll();
-           nextMessage != null;
-           nextMessage = nextBatch.messages.poll()) {
-        try {
-          // This is a non-blocking flow controller.
-          flowController.reserve(
-                  1, nextMessage.receivedMessage.getMessage().getSerializedSize());
-        } catch (FlowController.MaxOutstandingElementCountReachedException
-                | FlowController.MaxOutstandingRequestBytesReachedException flowControlException) {
-          // This cannot be processed now due to flow control.
-          nextBatch.messages.addFirst(nextMessage);
-          outstandingMessageBatches.addFirst(nextBatch);
-          return;
-        } catch (FlowControlException unexpectedException) {
-          throw new IllegalStateException("Flow control unexpected exception", unexpectedException);
-        }
-        processMessage(nextMessage);
+    pendingReceipts.add(message.getAckId());
+    executor.execute(new Runnable() {
+      @Override
+      public void run() {
+        processMessageOnExecutor(message, ackHandler);
       }
-      nextBatch.doneCallback.run();
-    }
+    });
   }
 
-  /** Process a single outstanding message that is allowed by flow control. */
-  private void processMessage(OutstandingMessage message) {
-    final PubsubMessage pubsubMessage = message.receivedMessage().getMessage();
-    final AckHandler ackHandler = message.ackHandler();
-    final SettableApiFuture<AckReply> response = SettableApiFuture.create();
-    final AckReplyConsumer consumer =
-            new AckReplyConsumer() {
-              @Override
-              public void ack() {
-                response.set(AckReply.ACK);
-              }
-
-              @Override
-              public void nack() {
-                response.set(AckReply.NACK);
-              }
-            };
-    ApiFutures.addCallback(response, ackHandler, MoreExecutors.directExecutor());
-    executor.execute(
-            new Runnable() {
-              @Override
-              public void run() {
-                try {
-                  if (ackHandler
-                          .totalExpiration
-                          .plusSeconds(messageDeadlineSeconds.get())
-                          .isBefore(now())) {
-                    // Message expired while waiting. We don't extend these messages anymore,
-                    // so it was probably sent to someone else. Don't work on it.
-                    // Don't nack it either, because we'd be nacking someone else's message.
-                    ackHandler.forget();
-                    return;
-                  }
-
-                  receiver.receiveMessage(pubsubMessage, consumer);
-                } catch (Exception e) {
-                  response.setException(e);
-                }
-              }
-            });
+  private void processMessageOnExecutor(ReceivedMessage message, AckHandler ackHandler) {
+    try {
+      if (ackHandler
+          .totalExpiration
+          .plusSeconds(messageDeadlineSeconds.get())
+          .isBefore(now())) {
+        // Message expired while waiting. We don't extend these messages anymore,
+        // so it was probably sent to someone else. Don't work on it.
+        // Don't nack it either, because we'd be nacking someone else's message.
+        ackHandler.forget();
+        return;
+      }
+      receiver.receiveMessage(message.getMessage(), ackHandler);
+    } catch (Exception e) {
+      logger.log(
+          Level.WARNING,
+          "MessageReceiver failed to processes ack ID: "
+              + ackHandler.ackId
+              + ", the message will be nacked.",
+          e);
+      ackHandler.nack();
+    }
   }
 
   /** Compute the ideal deadline, set subsequent modacks to this deadline, and return it. */
