@@ -18,10 +18,8 @@ package com.google.cloud.pubsub.v1;
 
 import com.google.api.core.AbstractApiService;
 import com.google.api.core.ApiClock;
-import com.google.api.core.ApiFuture;
 import com.google.api.core.ApiFutureCallback;
 import com.google.api.core.ApiFutures;
-import com.google.api.core.InternalApi;
 import com.google.api.core.SettableApiFuture;
 import com.google.api.gax.batching.FlowController;
 import com.google.api.gax.core.Distribution;
@@ -32,19 +30,11 @@ import com.google.api.gax.rpc.ApiExceptionFactory;
 import com.google.api.gax.rpc.ClientStream;
 import com.google.api.gax.rpc.ResponseObserver;
 import com.google.api.gax.rpc.StreamController;
-import com.google.cloud.pubsub.v1.MessageDispatcher.AckProcessor;
-import com.google.cloud.pubsub.v1.MessageDispatcher.PendingModifyAckDeadline;
 import com.google.cloud.pubsub.v1.stub.SubscriberStub;
-import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.MoreExecutors;
-import com.google.protobuf.Empty;
-import com.google.pubsub.v1.AcknowledgeRequest;
-import com.google.pubsub.v1.ModifyAckDeadlineRequest;
 import com.google.pubsub.v1.StreamingPullRequest;
 import com.google.pubsub.v1.StreamingPullResponse;
 import io.grpc.Status;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
@@ -56,15 +46,15 @@ import javax.annotation.Nullable;
 import org.threeten.bp.Duration;
 
 /** Implementation of {@link AckProcessor} based on Cloud Pub/Sub streaming pull. */
-final class StreamingSubscriberConnection extends AbstractApiService implements AckProcessor {
+final class StreamingSubscriberConnection extends AbstractApiService {
   private static final Logger logger =
       Logger.getLogger(StreamingSubscriberConnection.class.getName());
 
   private static final Duration INITIAL_CHANNEL_RECONNECT_BACKOFF = Duration.ofMillis(100);
   private static final Duration MAX_CHANNEL_RECONNECT_BACKOFF = Duration.ofSeconds(10);
-  private static final int MAX_PER_REQUEST_CHANGES = 1000;
 
   private final SubscriberStub stub;
+  private final AckProcessor ackProcessor;
   private final int channelAffinity;
   private final String subscription;
   private final ScheduledExecutorService systemExecutor;
@@ -91,11 +81,12 @@ final class StreamingSubscriberConnection extends AbstractApiService implements 
     this.subscription = subscription;
     this.systemExecutor = systemExecutor;
     this.stub = stub;
+    this.ackProcessor = new BatchingAckProcessor(executor, new StubAckProcessor(stub, subscription));
     this.channelAffinity = channelAffinity;
     this.messageDispatcher =
         new MessageDispatcher(
             receiver,
-            this,
+            ackProcessor,
             ackExpirationPadding,
             maxAckExtensionPeriod,
             ackLatencyDistribution,
@@ -108,6 +99,7 @@ final class StreamingSubscriberConnection extends AbstractApiService implements 
   @Override
   protected void doStart() {
     logger.config("Starting subscriber.");
+    ackProcessor.startAsync().awaitRunning();
     messageDispatcher.start();
     initialize();
     notifyStarted();
@@ -116,7 +108,7 @@ final class StreamingSubscriberConnection extends AbstractApiService implements 
   @Override
   protected void doStop() {
     messageDispatcher.stop();
-
+    ackProcessor.stopAsync().awaitTerminated();
     lock.lock();
     try {
       clientStream.closeSendWithError(Status.CANCELLED.asException());
@@ -261,48 +253,5 @@ final class StreamingSubscriberConnection extends AbstractApiService implements 
   private boolean isAlive() {
     State state = state(); // Read the state only once.
     return state == State.RUNNING || state == State.STARTING;
-  }
-
-  @Override
-  public void sendAckOperations(
-      List<String> acksToSend, List<PendingModifyAckDeadline> ackDeadlineExtensions) {
-    ApiFutureCallback<Empty> loggingCallback =
-        new ApiFutureCallback<Empty>() {
-          @Override
-          public void onSuccess(Empty empty) {
-            // noop
-          }
-
-          @Override
-          public void onFailure(Throwable t) {
-            Level level = isAlive() ? Level.WARNING : Level.FINER;
-            logger.log(level, "failed to send operations", t);
-          }
-        };
-
-    for (PendingModifyAckDeadline modack : ackDeadlineExtensions) {
-      for (List<String> idChunk : Lists.partition(modack.ackIds, MAX_PER_REQUEST_CHANGES)) {
-        ApiFuture<Empty> future =
-            stub.modifyAckDeadlineCallable()
-                .futureCall(
-                    ModifyAckDeadlineRequest.newBuilder()
-                        .setSubscription(subscription)
-                        .addAllAckIds(idChunk)
-                        .setAckDeadlineSeconds(modack.deadlineExtensionSeconds)
-                        .build());
-        ApiFutures.addCallback(future, loggingCallback);
-      }
-    }
-
-    for (List<String> idChunk : Lists.partition(acksToSend, MAX_PER_REQUEST_CHANGES)) {
-      ApiFuture<Empty> future =
-          stub.acknowledgeCallable()
-              .futureCall(
-                  AcknowledgeRequest.newBuilder()
-                      .setSubscription(subscription)
-                      .addAllAckIds(idChunk)
-                      .build());
-      ApiFutures.addCallback(future, loggingCallback);
-    }
   }
 }

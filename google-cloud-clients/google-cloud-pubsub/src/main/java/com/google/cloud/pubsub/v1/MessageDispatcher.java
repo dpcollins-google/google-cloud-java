@@ -74,8 +74,6 @@ class MessageDispatcher {
   // Maps ID to "total expiration time". If it takes longer than this, stop extending.
   private final ConcurrentMap<String, AckHandler> pendingMessages = new ConcurrentHashMap<>();
 
-  private final LinkedBlockingQueue<String> pendingAcks = new LinkedBlockingQueue<>();
-  private final LinkedBlockingQueue<String> pendingNacks = new LinkedBlockingQueue<>();
   private final LinkedBlockingQueue<String> pendingReceipts = new LinkedBlockingQueue<>();
 
   // The deadline should be set before use. Here, set it to something unreasonable,
@@ -87,28 +85,6 @@ class MessageDispatcher {
 
   // To keep track of number of seconds the receiver takes to process messages.
   private final Distribution ackLatencyDistribution;
-
-  /** Stores the data needed to asynchronously modify acknowledgement deadlines. */
-  static class PendingModifyAckDeadline {
-    final List<String> ackIds;
-    final int deadlineExtensionSeconds;
-
-    PendingModifyAckDeadline(int deadlineExtensionSeconds, String... ackIds) {
-      this(deadlineExtensionSeconds, Arrays.asList(ackIds));
-    }
-
-    private PendingModifyAckDeadline(int deadlineExtensionSeconds, Collection<String> ackIds) {
-      this.ackIds = new ArrayList<>(ackIds);
-      this.deadlineExtensionSeconds = deadlineExtensionSeconds;
-    }
-
-    @Override
-    public String toString() {
-      return String.format(
-          "PendingModifyAckDeadline{extension: %d sec, ackIds: %s}",
-          deadlineExtensionSeconds, ackIds);
-    }
-  }
 
   /** Handles callbacks for acking/nacking messages from the {@link MessageReceiver}. */
   private class AckHandler implements AckReplyConsumer {
@@ -143,20 +119,15 @@ class MessageDispatcher {
       ackLatencyDistribution.record(
           Ints.saturatedCast(
               (long) Math.ceil((clock.millisTime() - receivedTimeMillis) / 1000D)));
-      pendingAcks.add(ackId);
+      ackProcessor.ack(Collections.singletonList(ackId));
       forget();
     }
 
     @Override
     public void nack() {
-      pendingNacks.add(ackId);
+      ackProcessor.nack(Collections.singletonList(ackId));
       forget();
     }
-  }
-
-  public interface AckProcessor {
-    void sendAckOperations(
-        List<String> acksToSend, List<PendingModifyAckDeadline> ackDeadlineExtensions);
   }
 
   MessageDispatcher(
@@ -221,7 +192,7 @@ class MessageDispatcher {
                           newDeadlineSec - ackExpirationPadding.getSeconds(),
                           TimeUnit.SECONDS);
                     }
-                    processOutstandingAckOperations();
+                    processReceipts();
                   } catch (Throwable t) {
                     // Catch everything so that one run failing doesn't prevent subsequent runs.
                     logger.log(Level.WARNING, "failed to run periodic job", t);
@@ -247,7 +218,7 @@ class MessageDispatcher {
     } finally {
       jobLock.unlock();
     }
-    processOutstandingAckOperations();
+    processReceipts();
   }
 
   @InternalApi
@@ -315,10 +286,12 @@ class MessageDispatcher {
       } catch (FlowController.MaxOutstandingElementCountReachedException
           | FlowController.MaxOutstandingRequestBytesReachedException flowControlException) {
         // Nack all messages if flow controlled.  They cannot be handled now.
-        pendingNacks.add(nextMessage.receivedMessage.getAckId());
+        List<String> nacks = new ArrayList<>();
+        nacks.add(nextMessage.receivedMessage.getAckId());
         while (messageIterator.hasNext()) {
-          pendingNacks.add(messageIterator.next().receivedMessage.getAckId());
+          nacks.add(messageIterator.next().receivedMessage.getAckId());
         }
+        ackProcessor.nack(nacks);
         return;
       } catch (FlowControlException unexpectedException) {
         throw new IllegalStateException("Flow control unexpected exception", unexpectedException);
@@ -377,8 +350,7 @@ class MessageDispatcher {
   @InternalApi
   void extendDeadlines() {
     int extendSeconds = getMessageDeadlineSeconds();
-    List<PendingModifyAckDeadline> modacks = new ArrayList<>();
-    PendingModifyAckDeadline modack = new PendingModifyAckDeadline(extendSeconds);
+    List<String> modacks = new ArrayList<>();
     Instant now = now();
     Instant extendTo = now.plusSeconds(extendSeconds);
 
@@ -386,7 +358,7 @@ class MessageDispatcher {
       String ackId = entry.getKey();
       Instant totalExpiration = entry.getValue().totalExpiration;
       if (totalExpiration.isAfter(extendTo)) {
-        modack.ackIds.add(ackId);
+        modacks.add(ackId);
         continue;
       }
 
@@ -395,40 +367,20 @@ class MessageDispatcher {
       entry.getValue().forget();
       if (totalExpiration.isAfter(now)) {
         int sec = Math.max(1, (int) now.until(totalExpiration, ChronoUnit.SECONDS));
-        modacks.add(new PendingModifyAckDeadline(sec, ackId));
+        ackProcessor.extendDeadlines(Collections.singletonList(entry.getKey()), sec);
       }
     }
-    logger.log(Level.FINER, "Sending {0} modacks", modack.ackIds.size() + modacks.size());
-    modacks.add(modack);
+    logger.log(Level.FINER, "Sending {0} modacks", modacks.size());
 
-    List<String> acksToSend = Collections.emptyList();
-    ackProcessor.sendAckOperations(acksToSend, modacks);
+    ackProcessor.extendDeadlines(modacks, extendSeconds);
   }
 
   @InternalApi
-  void processOutstandingAckOperations() {
-    List<PendingModifyAckDeadline> modifyAckDeadlinesToSend = new ArrayList<>();
-
-    List<String> acksToSend = new ArrayList<>();
-    pendingAcks.drainTo(acksToSend);
-    logger.log(Level.FINER, "Sending {0} acks", acksToSend.size());
-
-    PendingModifyAckDeadline nacksToSend = new PendingModifyAckDeadline(0);
-    pendingNacks.drainTo(nacksToSend.ackIds);
-    logger.log(Level.FINER, "Sending {0} nacks", nacksToSend.ackIds.size());
-    if (!nacksToSend.ackIds.isEmpty()) {
-      modifyAckDeadlinesToSend.add(nacksToSend);
-    }
-
-    PendingModifyAckDeadline receiptsToSend =
-        new PendingModifyAckDeadline(getMessageDeadlineSeconds());
-    pendingReceipts.drainTo(receiptsToSend.ackIds);
-    logger.log(Level.FINER, "Sending {0} receipts", receiptsToSend.ackIds.size());
-    if (!receiptsToSend.ackIds.isEmpty()) {
-      modifyAckDeadlinesToSend.add(receiptsToSend);
-    }
-
-    ackProcessor.sendAckOperations(acksToSend, modifyAckDeadlinesToSend);
+  void processReceipts() {
+    List<String> receiptsToSend = new ArrayList<>();
+    pendingReceipts.drainTo(receiptsToSend);
+    logger.log(Level.FINER, "Sending {0} receipts", receiptsToSend.size());
+    ackProcessor.extendDeadlines(receiptsToSend, getMessageDeadlineSeconds());
   }
 
   private Instant now() {
