@@ -130,49 +130,17 @@ final class StreamingSubscriberConnection extends AbstractApiService implements 
 
     final SettableApiFuture<Void> errorFuture;
 
-    /**
-     * When a batch finsihes processing, we want to request one more batch from the server. But by
-     * the time this happens, our stream might have already errored, and new stream created. We
-     * don't want to request more batches from the new stream -- that might pull more messages than
-     * the user can deal with -- so we save the request observer this response observer is "paired
-     * with". If the stream has already errored, requesting more messages is a no-op.
-     */
-    StreamController thisController;
-
     StreamingPullResponseObserver(SettableApiFuture<Void> errorFuture) {
       this.errorFuture = errorFuture;
     }
 
     @Override
-    public void onStart(StreamController controller) {
-      thisController = controller;
-      thisController.disableAutoInboundFlowControl();
-      thisController.request(1);
-    }
+    public void onStart(StreamController controller) {}
 
     @Override
     public void onResponse(StreamingPullResponse response) {
       channelReconnectBackoffMillis.set(INITIAL_CHANNEL_RECONNECT_BACKOFF.toMillis());
-      messageDispatcher.processReceivedMessages(
-          response.getReceivedMessagesList(),
-          new Runnable() {
-            @Override
-            public void run() {
-              // Only request more if we're not shutdown.
-              // If errorFuture is done, the stream has either failed or hung up,
-              // and we don't need to request.
-              if (isAlive() && !errorFuture.isDone()) {
-                lock.lock();
-                try {
-                  thisController.request(1);
-                } catch (Exception e) {
-                  logger.log(Level.WARNING, "cannot request more messages", e);
-                } finally {
-                  lock.unlock();
-                }
-              }
-            }
-          });
+      messageDispatcher.processReceivedMessages(response.getReceivedMessagesList());
     }
 
     @Override

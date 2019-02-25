@@ -93,7 +93,7 @@ public class Subscriber extends AbstractApiService {
   private static final Duration UNARY_TIMEOUT = Duration.ofSeconds(60);
 
   private static final int SYSTEM_EXECUTOR_MIN_THREAD_COUNT = 6;
-  private static final int SYSTEM_EXECUTOR_THREADS_PER_PULLER = 2;
+  private static final int SYSTEM_EXECUTOR_THREADS_PER_PULLER = 3;
 
   private static final Logger logger = Logger.getLogger(Subscriber.class.getName());
 
@@ -135,7 +135,7 @@ public class Subscriber extends AbstractApiService {
             builder
                 .flowControlSettings
                 .toBuilder()
-                .setLimitExceededBehavior(LimitExceededBehavior.ThrowException)
+                .setLimitExceededBehavior(LimitExceededBehavior.Block)
                 .build());
 
     executor = builder.executorProvider.getExecutor();
