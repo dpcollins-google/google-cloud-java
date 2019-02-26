@@ -68,8 +68,6 @@ public class PublisherImplTest {
 
   private Server testServer;
 
-  class FakeException extends Exception {}
-
   @Before
   public void setUp() throws Exception {
     testPublisherServiceImpl = new FakePublisherServiceImpl();
@@ -187,6 +185,31 @@ public class PublisherImplTest {
     ApiFuture<String> publishFuture4 = sendTestMessage(publisher, "D");
     assertEquals("3", publishFuture3.get());
     assertEquals("4", publishFuture4.get());
+
+    assertEquals(2, testPublisherServiceImpl.getCapturedRequests().size());
+    publisher.shutdown();
+    publisher.awaitTermination(1, TimeUnit.MINUTES);
+  }
+
+  @Test
+  public void testSinglePublishBatchingDisabled() throws Exception {
+    Publisher publisher =
+        getTestPublisherBuilder()
+            .setBatchingSettings(
+                Publisher.Builder.DEFAULT_BATCHING_SETTINGS.toBuilder().setIsEnabled(false).build())
+            .build();
+
+    testPublisherServiceImpl
+        .addPublishResponse(PublishResponse.newBuilder().addMessageIds("1"))
+        .addPublishResponse(PublishResponse.newBuilder().addMessageIds("2"));
+
+    ApiFuture<String> publishFuture1 = sendTestMessage(publisher, "A");
+
+    // Note we are not advancing time but messages should still get published.
+    assertEquals("1", publishFuture1.get());
+
+    ApiFuture<String> publishFuture2 = sendTestMessage(publisher, "B");
+    assertEquals("2", publishFuture2.get());
 
     assertEquals(2, testPublisherServiceImpl.getCapturedRequests().size());
     publisher.shutdown();
